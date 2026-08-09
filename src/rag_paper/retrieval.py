@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -146,9 +147,48 @@ class HybridRetriever:
         self.store = ChromaPaperStore(config.chroma_dir, config.chroma.collection, embeddings)
         self.config = config
         self.stats = RetrievalStats(config.stats_path)
+        # The manifest is rewritten on every index/delete/metadata-refresh, so its
+        # mtime is a cheap "the library changed" signal for a long-lived server.
+        self._manifest_path = config.chroma_dir / "index_manifest.json"
+        self._reload_generation: int | None = self._current_generation()
+        self._reload_lock = threading.Lock()
         self._bm25_corpus: BM25Corpus | None = None
         self._bm25_corpus_count: int | None = None
         self._reranker: RerankerProvider | None = build_reranker_provider(config)
+
+    def _current_generation(self) -> int | None:
+        """Manifest mtime (ns) as a staleness signal; None when no manifest yet."""
+        try:
+            return self._manifest_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _refresh_if_stale(self) -> None:
+        """Reload the store and drop the BM25 cache when the manifest changed.
+
+        A long-lived stdio MCP server keeps a PersistentClient and a BM25 index in
+        memory; writes from the CLI indexer (a separate process) are not otherwise
+        visible. Since the manifest is rewritten on every index/delete/metadata
+        refresh, its mtime reliably signals "the library changed." Checked at query
+        entry so the next query transparently reflects CLI updates with no restart.
+        """
+        generation = self._current_generation()
+        if generation == self._reload_generation:
+            return
+        with self._reload_lock:
+            # Re-check under the lock: another query may have reloaded already.
+            generation = self._current_generation()
+            if generation == self._reload_generation:
+                return
+            self.store.reload()
+            self._bm25_corpus = None
+            self._bm25_corpus_count = None
+            self._reload_generation = generation
+            logger.info(
+                "retrieval.hot_reload",
+                generation=generation,
+                manifest=str(self._manifest_path),
+            )
 
     def search(
         self,
@@ -161,6 +201,7 @@ class HybridRetriever:
         file_name: str | None = None,
         group_by_paper: bool = False,
     ) -> list[SearchResult]:
+        self._refresh_if_stale()
         top_k = top_k or self.config.retrieval.default_top_k
         where = chroma_metadata_filter(year=year, file_name=file_name)
         vector_results = self._vector_search(query, where, author=author, tag=tag, year=year, file_name=file_name)
@@ -220,6 +261,7 @@ class HybridRetriever:
         limit: int = 20,
         group_by_paper: bool = False,
     ) -> list[SearchResult]:
+        self._refresh_if_stale()
         where = chroma_metadata_filter(year=year, file_name=file_name)
         payload = self.store.list_chunks(where=where)
         results = [
@@ -325,9 +367,11 @@ class HybridRetriever:
         return dict(list(results.items())[: self.config.retrieval.vector_top_k])
 
     def _get_bm25_corpus(self) -> BM25Corpus:
-        # Reuse one BM25 index across queries and rebuild only when the chunk
-        # count changes (papers added/removed). count() is a cheap Chroma call,
-        # so steady-state queries skip the O(N) tokenize + index build entirely.
+        # _refresh_if_stale() (called at query entry) reloads the store and clears
+        # _bm25_corpus when the manifest changes, so a long-lived server picks up
+        # CLI writes. The count check below is a cheap defensive fallback that
+        # also rebuilds if the live chunk count ever drifts (count() is a single
+        # Chroma call), keeping steady-state queries off the O(N) rebuild.
         count = self.store.count()
         if self._bm25_corpus is None or self._bm25_corpus_count != count:
             payload = self.store.list_chunks()
@@ -430,20 +474,34 @@ def _chunk_index_key(metadata: dict[str, Any]) -> int:
     return index if isinstance(index, int) else 10**9
 
 
+def _paper_group_key(metadata: dict[str, Any], chunk_id: str) -> str:
+    """Group key for folding chunks by paper.
+
+    Prefer DOI so the same paper indexed from two roots (e.g. PublicPapers and a
+    Zotero export) folds into one result instead of appearing twice; fall back to
+    source_path when no DOI is present, and to the chunk id as a last resort.
+    """
+    doi = metadata.get("doi")
+    if isinstance(doi, str) and doi.strip():
+        return f"doi:{doi.strip().lower()}"
+    return str(metadata.get("source_path") or chunk_id)
+
+
 def _group_by_paper(ranked: list[SearchResult], *, top_k: int) -> list[SearchResult]:
     """Collapse ranked chunks to the best chunk per paper.
 
-    Keeps the highest-scoring chunk for each distinct ``source_path`` and records
-    how many of the ranked chunks belonged to that paper plus their ids, so a
-    caller (typically an LLM) sees coverage breadth instead of one paper's chunks
-    crowding the whole result set. Returns up to ``top_k`` papers in score order.
+    Keeps the highest-scoring chunk for each distinct paper (keyed by DOI when
+    available, else source_path) and records how many of the ranked chunks
+    belonged to that paper plus their ids, so a caller (typically an LLM) sees
+    coverage breadth instead of one paper's chunks crowding the whole result set.
+    Returns up to ``top_k`` papers in score order.
     """
     best: dict[str, SearchResult] = {}
     counts: dict[str, int] = {}
     other_ids: dict[str, list[str]] = {}
     order: list[str] = []
     for result in ranked:
-        key = str(result.metadata.get("source_path") or result.chunk_id)
+        key = _paper_group_key(result.metadata, result.chunk_id)
         counts[key] = counts.get(key, 0) + 1
         if key not in best:
             best[key] = result

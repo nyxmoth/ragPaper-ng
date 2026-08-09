@@ -26,13 +26,28 @@ def normalize_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float 
 
 class ChromaPaperStore:
     def __init__(self, persist_dir: Path, collection_name: str, embeddings: EmbeddingProvider) -> None:
+        self.persist_dir = persist_dir
+        self.collection_name = collection_name
+        self.embeddings = embeddings
         persist_dir.mkdir(parents=True, exist_ok=True)
-        self.client = chromadb.PersistentClient(path=str(persist_dir))
+        self._open()
+
+    def _open(self) -> None:
+        self.client = chromadb.PersistentClient(path=str(self.persist_dir))
         self.collection: Collection = self.client.get_or_create_collection(
-            name=collection_name,
+            name=self.collection_name,
             metadata={"hnsw:space": "cosine"},
         )
-        self.embeddings = embeddings
+
+    def reload(self) -> None:
+        """Re-open the Chroma client and collection in place.
+
+        A long-lived process (e.g. the stdio MCP server) caches collection data in
+        its PersistentClient, so writes from another process (the CLI indexer) are
+        not otherwise visible. Re-opening forces the next read to load current
+        on-disk state. The embedding provider is reused, so this is cheap.
+        """
+        self._open()
 
     def upsert_chunks(self, chunks: list[PaperChunk], batch_size: int = 32) -> None:
         for start in range(0, len(chunks), batch_size):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from dataclasses import asdict
@@ -43,6 +44,25 @@ class EnrichmentSummary:
     skipped_files: int
     failed_files: int
     cleared_files: int = 0
+    low_confidence_files: int = 0
+    review_path: str = ""
+
+
+@dataclass(frozen=True)
+class EnrichmentVerdict:
+    """Outcome of validating a looked-up work against the local document.
+
+    ``accepted`` is the basic gate (title similarity + year); ``confidence``
+    grades an accepted match so dubious near-matches can be routed to a human
+    review queue instead of silently polluting the metadata. ``high`` is written
+    automatically; ``low`` is queued and not written.
+    """
+
+    accepted: bool
+    confidence: str  # "high" | "low"
+    reason: str
+    title_similarity: float
+    reference_title: str = ""
 
 
 @dataclass(frozen=True)
@@ -236,6 +256,7 @@ def enrich_metadata(
     force: bool = False,
     file_path: str | None = None,
     max_files: int | None = None,
+    dry_run: bool = False,
 ) -> EnrichmentSummary:
     if not config.metadata_enrichment.enabled:
         logger.info("metadata.enrichment_disabled")
@@ -246,14 +267,17 @@ def enrich_metadata(
     if max_files is not None:
         targets = targets[:max_files]
 
-    # Build a store so enrichment can index each paper's abstract as a searchable
-    # chunk. Imported lazily to keep this module decoupled from the indexing stack.
-    from rag_paper.embeddings import build_embedding_provider
-    from rag_paper.store import ChromaPaperStore
+    store: ChromaPaperStore | None = None
+    if not dry_run:
+        # Build a store so enrichment can index each paper's abstract as a
+        # searchable chunk. Imported lazily to keep this module decoupled from the
+        # indexing stack. Skipped in dry-run (no Chroma writes).
+        from rag_paper.embeddings import build_embedding_provider
+        from rag_paper.store import ChromaPaperStore
 
-    store = ChromaPaperStore(
-        config.chroma_dir, config.chroma.collection, build_embedding_provider(config)
-    )
+        store = ChromaPaperStore(
+            config.chroma_dir, config.chroma.collection, build_embedding_provider(config)
+        )
     try:
         summary = enrich_targets(
             config,
@@ -261,10 +285,13 @@ def enrich_metadata(
             metadata_map=metadata_map,
             force=force,
             store=store,
+            dry_run=dry_run,
         )
     finally:
-        store.client.close()
-    save_paper_metadata(config.metadata_path, metadata_map)
+        if store is not None:
+            store.client.close()
+    if not dry_run:
+        save_paper_metadata(config.metadata_path, metadata_map)
     return summary
 
 
@@ -276,6 +303,7 @@ def enrich_targets(
     force: bool = False,
     reverify: bool = False,
     store: ChromaPaperStore | None = None,
+    dry_run: bool = False,
 ) -> EnrichmentSummary:
     if not config.metadata_enrichment.enabled:
         return EnrichmentSummary(checked_files=0, updated_files=0, skipped_files=0, failed_files=0)
@@ -289,6 +317,7 @@ def enrich_targets(
     skipped_files = 0
     failed_files = 0
     cleared_files = 0
+    low_confidence_files = 0
 
     try:
         try:
@@ -307,7 +336,7 @@ def enrich_targets(
                 merged = dict(existing)
                 merged.update({key: value for key, value in target.metadata.items() if value})
 
-                work, provider_failed = _lookup_work_with_fallback(
+                graded, provider_failed = _lookup_work_with_fallback(
                     clients,
                     config.metadata_enrichment,
                     cache,
@@ -317,7 +346,7 @@ def enrich_targets(
                     reverify=reverify,
                 )
 
-                if work is None:
+                if graded is None:
                     if provider_failed:
                         failed_files += 1
                         logger.warning("metadata.all_providers_failed", file=str(target.path))
@@ -327,10 +356,11 @@ def enrich_targets(
                         # it so the wrong DOI/title/authors stop polluting search &
                         # citations. (Skipped on provider failure: that may be
                         # transient, so existing data is left intact.)
-                        key = metadata_key_for_pdf(metadata_map, target.path)
                         previous_doi = existing["doi"]
-                        metadata_map[key] = _clear_enrichment_fields(existing)
-                        save_paper_metadata(config.metadata_path, metadata_map)
+                        if not dry_run:
+                            key = metadata_key_for_pdf(metadata_map, target.path)
+                            metadata_map[key] = _clear_enrichment_fields(existing)
+                            save_paper_metadata(config.metadata_path, metadata_map)
                         cleared_files += 1
                         logger.warning(
                             "metadata.cleared_unmatched",
@@ -342,19 +372,41 @@ def enrich_targets(
                         logger.info("metadata.no_provider_match", file=str(target.path))
                     continue
 
-                key = metadata_key_for_pdf(metadata_map, target.path)
-                metadata_map[key] = _merge_work_metadata(merged, work, force=force or reverify)
-                if reverify and existing.get("doi") and _normalize_doi(existing["doi"]) != work.doi:
-                    logger.warning(
-                        "metadata.reverify_corrected",
+                work, verdict = graded
+                if verdict.confidence != "high":
+                    # Passed the basic gate but not confidently (weak title or
+                    # author disagreement). Do NOT write plausible-but-wrong data;
+                    # record it for human review instead.
+                    low_confidence_files += 1
+                    _record_review(config, target.path, work, verdict)
+                    logger.info(
+                        "metadata.low_confidence",
                         file=str(target.path),
-                        previous_doi=existing["doi"],
                         doi=work.doi,
-                        title=work.title,
-                        source=work.source,
+                        confidence=verdict.confidence,
+                        reason=verdict.reason,
+                        similarity=round(verdict.title_similarity, 3),
                     )
-                _maybe_index_abstract(store, metadata_map[key], target.path)
-                save_paper_metadata(config.metadata_path, metadata_map)
+                    continue
+
+                if not dry_run:
+                    key = metadata_key_for_pdf(metadata_map, target.path)
+                    metadata_map[key] = _merge_work_metadata(merged, work, force=force or reverify)
+                    if (
+                        reverify
+                        and existing.get("doi")
+                        and _normalize_doi(existing["doi"]) != work.doi
+                    ):
+                        logger.warning(
+                            "metadata.reverify_corrected",
+                            file=str(target.path),
+                            previous_doi=existing["doi"],
+                            doi=work.doi,
+                            title=work.title,
+                            source=work.source,
+                        )
+                    _maybe_index_abstract(store, metadata_map[key], target.path)
+                    save_paper_metadata(config.metadata_path, metadata_map)
                 updated_files += 1
                 logger.info(
                     "metadata.enriched",
@@ -362,6 +414,7 @@ def enrich_targets(
                     doi=work.doi,
                     title=work.title,
                     source=work.source,
+                    dry_run=dry_run,
                 )
         except KeyboardInterrupt:
             logger.warning("metadata.interrupted", updated_files=updated_files)
@@ -370,13 +423,16 @@ def enrich_targets(
             client.close()
         cache.close()
 
-    save_paper_metadata(config.metadata_path, metadata_map)
+    if not dry_run:
+        save_paper_metadata(config.metadata_path, metadata_map)
     return EnrichmentSummary(
         checked_files=checked_files,
         updated_files=updated_files,
         skipped_files=skipped_files,
         failed_files=failed_files,
         cleared_files=cleared_files,
+        low_confidence_files=low_confidence_files,
+        review_path=str(config.enrichment_review_path) if low_confidence_files else "",
     )
 
 
@@ -462,14 +518,14 @@ def _lookup_work_with_fallback(
     *,
     force: bool,
     reverify: bool = False,
-) -> tuple[MetadataWork | None, bool]:
+) -> tuple[tuple[MetadataWork, EnrichmentVerdict] | None, bool]:
     provider_failed = False
     for provider in _provider_order(config):
         client = clients.get(provider)
         if client is None:
             continue
         try:
-            work = _lookup_work(
+            graded = _lookup_work_graded(
                 client, provider, cache, target, metadata, force=force, reverify=reverify
             )
         except httpx.HTTPError as exc:
@@ -481,13 +537,13 @@ def _lookup_work_with_fallback(
                 error=str(exc),
             )
             continue
-        if work is not None:
-            return work, provider_failed
+        if graded is not None:
+            return graded, provider_failed
         logger.info("metadata.provider_no_match", provider=provider, file=str(target.path))
     return None, provider_failed
 
 
-def _lookup_work(
+def _lookup_work_graded(
     client: CrossRefClient | OpenAlexClient,
     provider: MetadataProviderName,
     cache: MetadataEnrichmentCache,
@@ -496,25 +552,29 @@ def _lookup_work(
     *,
     force: bool,
     reverify: bool = False,
-) -> MetadataWork | None:
+) -> tuple[MetadataWork, EnrichmentVerdict] | None:
     config = client.config
     min_similarity = config.min_title_similarity
+    min_similarity_high = config.min_title_similarity_high
+    reference_authors = _reference_authors(metadata)
 
+    file_name = str(metadata.get("file_name") or target.path.name)
+    filename_title, filename_year = parse_filename_title_and_year(file_name)
     if force or reverify:
         # We are re-checking data that may already be wrong. The filename
         # ("Authors - Year - Title.pdf" for Zotero libraries) is the most reliable
         # reference — body-text inference can pick boilerplate like "Published as
         # a conference paper at ICLR ...". Prefer the filename title/year and fall
         # back to the text-derived title only when the filename doesn't parse.
-        file_name = str(metadata.get("file_name") or target.path.name)
-        filename_title, filename_year = parse_filename_title_and_year(file_name)
         reference_title = filename_title or pick_title_line(
             target.text.splitlines(), file_name=file_name
         )
-        expected_year = filename_year
     else:
         reference_title = infer_title(metadata, target.text)
-        expected_year = None
+    # Cross-check the year whenever the filename provides one (Zotero naming is
+    # reliable) — not only in force/reverify mode. This rejects same-title
+    # different-year near-namesakes in normal runs too. None when no filename year.
+    expected_year = filename_year
 
     # A DOI mined out of the PDF body is often a *citation*, not this paper's own
     # DOI. Treat user-supplied DOIs (metadata.doi/url/external_url) as trusted;
@@ -535,16 +595,19 @@ def _lookup_work(
         work = cached if cached is not None else client.lookup_by_doi(possible_doi)
         if work is None:
             continue
-        if _accept_work(
+        verdict = _evaluate_work(
             work,
             reference_title,
             is_trusted=is_trusted,
             min_similarity=min_similarity,
+            min_similarity_high=min_similarity_high,
             expected_year=expected_year,
-        ):
+            reference_authors=reference_authors,
+        )
+        if verdict.accepted:
             if cached is None:
                 cache.set(provider, "doi", possible_doi, asdict(work))
-            return work
+            return work, verdict
         title_matched = _work_matches_title(work, reference_title, min_similarity)
         logger.warning(
             "metadata.doi_year_mismatch" if title_matched else "metadata.doi_title_mismatch",
@@ -564,16 +627,19 @@ def _lookup_work(
         work = cached if cached is not None else client.query_by_title(reference_title)
         if work is None:
             return None
-        if _accept_work(
+        verdict = _evaluate_work(
             work,
             reference_title,
             is_trusted=False,
             min_similarity=min_similarity,
+            min_similarity_high=min_similarity_high,
             expected_year=expected_year,
-        ):
+            reference_authors=reference_authors,
+        )
+        if verdict.accepted:
             if cached is None:
                 cache.set(provider, "title", title_key, asdict(work))
-            return work
+            return work, verdict
         title_matched = _work_matches_title(work, reference_title, min_similarity)
         logger.info(
             "metadata.year_mismatch" if title_matched else "metadata.title_similarity_below_threshold",
@@ -585,6 +651,24 @@ def _lookup_work(
             expected_year=expected_year,
         )
     return None
+
+
+def _lookup_work(
+    client: CrossRefClient | OpenAlexClient,
+    provider: MetadataProviderName,
+    cache: MetadataEnrichmentCache,
+    target: EnrichmentTarget,
+    metadata: dict[str, Any],
+    *,
+    force: bool,
+    reverify: bool = False,
+) -> MetadataWork | None:
+    """Boolean-view wrapper over ``_lookup_work_graded`` for callers/tests that
+    only need the matched work (accept/reject), not the confidence grade."""
+    graded = _lookup_work_graded(
+        client, provider, cache, target, metadata, force=force, reverify=reverify
+    )
+    return graded[0] if graded is not None else None
 
 
 def _cache_get_work(
@@ -643,6 +727,35 @@ def _maybe_index_abstract(
         logger.warning("metadata.abstract_chunk_failed", file=str(pdf_path), error=str(exc))
 
 
+def _record_review(
+    config: AppConfig, pdf_path: Path, work: MetadataWork, verdict: EnrichmentVerdict
+) -> None:
+    """Append a low-confidence match to the review queue (JSONL) for human action.
+
+    These are matches that cleared the basic gate but not confidently (weak title
+    similarity or author disagreement). Writing them automatically risks a wrong
+    cross-field DOI; queueing keeps the library clean while surfacing the
+    candidate with enough context to accept or reject by hand.
+    """
+    path = config.enrichment_review_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "file": str(pdf_path),
+        "doi": work.doi,
+        "provider": work.source,
+        "returned_title": work.title,
+        "returned_authors": work.authors,
+        "returned_year": work.year,
+        "reference_title": verdict.reference_title,
+        "title_similarity": round(verdict.title_similarity, 4),
+        "confidence": verdict.confidence,
+        "reason": verdict.reason,
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
 def _normalize_title_for_compare(value: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", (value or "").lower()).split())
 
@@ -692,6 +805,25 @@ def _year_matches(work: MetadataWork, expected_year: int | None) -> bool:
     return abs(work.year - expected_year) <= _YEAR_TOLERANCE
 
 
+def _basic_gate(
+    work: MetadataWork,
+    inferred_title: str,
+    *,
+    is_trusted: bool,
+    min_similarity: float,
+    expected_year: int | None = None,
+) -> tuple[bool, str]:
+    """Hard acceptance gate: trusted DOI passes; otherwise title similarity AND,
+    when a filename year is available, year agreement. Returns (accepted, reason)."""
+    if is_trusted:
+        return True, "trusted_doi"
+    if not _work_matches_title(work, inferred_title, min_similarity):
+        return False, "title_similarity_below_threshold"
+    if not _year_matches(work, expected_year):
+        return False, "year_mismatch"
+    return True, "title_and_year_match"
+
+
 def _accept_work(
     work: MetadataWork,
     inferred_title: str,
@@ -700,18 +832,96 @@ def _accept_work(
     min_similarity: float,
     expected_year: int | None = None,
 ) -> bool:
-    """Gate a looked-up work against the document's inferred title (and year).
+    """Boolean view of the basic gate (kept for callers/tests that only need
+    accept/reject). Use ``_evaluate_work`` when the confidence grade matters."""
+    return _basic_gate(
+        work,
+        inferred_title,
+        is_trusted=is_trusted,
+        min_similarity=min_similarity,
+        expected_year=expected_year,
+    )[0]
 
-    User-supplied (trusted) DOIs are accepted as-is — the user vouched for them.
-    Everything else — speculative DOIs mined from text, title-query best matches,
-    and cache hits — must clear the title-similarity threshold (and, when a
-    filename year is available, not diverge from it by more than the tolerance).
+
+def _reference_authors(metadata: dict[str, Any]) -> list[str]:
+    """Authors we can cross-check against, from user/PDF metadata. Best-effort:
+    often empty in normal mode, in which case author agreement cannot be judged."""
+    authors = metadata.get("authors")
+    if isinstance(authors, list):
+        return [str(item).strip() for item in authors if str(item).strip()]
+    if isinstance(authors, str) and authors.strip():
+        # Chroma flattens lists to ", "-joined strings; tolerate that.
+        return [part.strip() for part in authors.split(",") if part.strip()]
+    return []
+
+
+def _author_surnames(authors: list[str]) -> set[str]:
+    surnames: set[str] = set()
+    for author in authors:
+        tokens = re.sub(r"[^\w\s]", " ", author.lower()).split()
+        if tokens:
+            surnames.add(tokens[-1])
+    return surnames
+
+
+def _authors_overlap(reference: list[str], work_authors: list[str]) -> bool | None:
+    """True/False when both sides have authors and a surname can be compared;
+    None when either side is empty (cannot judge — do not penalize)."""
+    if not reference or not work_authors:
+        return None
+    return bool(_author_surnames(reference) & _author_surnames(work_authors))
+
+
+def _evaluate_work(
+    work: MetadataWork,
+    inferred_title: str,
+    *,
+    is_trusted: bool,
+    min_similarity: float,
+    min_similarity_high: float,
+    expected_year: int | None = None,
+    reference_authors: list[str] | None = None,
+) -> EnrichmentVerdict:
+    """Grade a looked-up work: hard gate first, then confidence.
+
+    - rejected (title too dissimilar, or year mismatch) -> accepted=False
+    - trusted DOI -> high
+    - accepted + strong title similarity + (author agrees or unknowable) -> high
+    - accepted but weak title, or author disagreement when comparable -> low
+
+    Low-confidence matches are NOT written; they go to the review queue so a
+    human decides, rather than a plausible-but-wrong cross-field DOI polluting
+    search and citations.
     """
+    title_similarity = (
+        _title_similarity(inferred_title, work.title)
+        if inferred_title and work.title
+        else 0.0
+    )
     if is_trusted:
-        return True
-    if not _work_matches_title(work, inferred_title, min_similarity):
-        return False
-    return _year_matches(work, expected_year)
+        return EnrichmentVerdict(
+            True, "high", "trusted_doi", title_similarity, inferred_title
+        )
+
+    accepted, reason = _basic_gate(
+        work,
+        inferred_title,
+        is_trusted=is_trusted,
+        min_similarity=min_similarity,
+        expected_year=expected_year,
+    )
+    if not accepted:
+        return EnrichmentVerdict(False, "low", reason, title_similarity, inferred_title)
+
+    title_strong = title_similarity >= min_similarity_high
+    author_overlap = _authors_overlap(reference_authors or [], work.authors)
+    detail = "strong_title" if title_strong else "weak_title"
+    if author_overlap is True:
+        detail += "+author_match"
+    elif author_overlap is False:
+        detail += "+author_mismatch"
+    confidence = "high" if (title_strong and author_overlap is not False) else "low"
+    return EnrichmentVerdict(True, confidence, detail, title_similarity, inferred_title)
 
 
 def _first_doi(

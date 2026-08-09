@@ -5,6 +5,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from rag_paper.config import AppConfig
+from rag_paper.indexer import load_index_status
 from rag_paper.inspection import inspect_indexed_paper, inspect_indexed_papers, paper_citations
 from rag_paper.logging import configure_logging
 from rag_paper.retrieval import HybridRetriever, result_to_dict
@@ -26,7 +27,8 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
             "chunk-granular, so a single paper may yield several chunks; use "
             "export_context to assemble the final context for a question. This service "
             "does not modify the library (index/enrich/delete are CLI-only) and is not "
-            "a chat model."
+            "a chat model. get_index_status reports the most recent `index` CLI update "
+            "(timestamp, mode, result counts) so you know when the library last changed."
         ),
     )
     retriever = HybridRetriever(config)
@@ -179,6 +181,28 @@ def create_mcp_server(config: AppConfig) -> FastMCP:
             "paper_roots": [str(path) for path in config.paper_dirs],
             "chroma_dir": str(config.chroma_dir),
             "collection": config.chroma.collection,
+        }
+
+    @mcp.tool()
+    def get_index_status(limit: int = 1) -> dict[str, Any]:
+        """Return the most recent library update(s) recorded by the `index` CLI.
+
+        Each record carries a UTC timestamp, the command and mode (e.g. force /
+        file / update_metadata_only), wall-clock duration, the total chunk count
+        after the update, the per-run result counts (indexed_files /
+        skipped_files / chunks / failed_files...), and ``result.updated_papers``:
+        a list of the papers the update actually touched, each with ``file_name``,
+        ``title``, ``doi``, ``year`` and ``chunks`` — use any of these to look up
+        the paper with search_papers / search_by_metadata / show_indexed_paper /
+        get_paper_citations. Use this to see when the indexed library last changed
+        and which papers were affected. limit=1 (default) returns just the latest;
+        a larger limit returns a short newest-first history.
+        """
+        records = load_index_status(config, limit=limit)
+        return {
+            "latest": records[0] if records else None,
+            "history": records,
+            "count": len(records),
         }
 
     return mcp

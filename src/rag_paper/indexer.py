@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from traceback import format_exception_only
@@ -29,6 +29,12 @@ class IndexSummary:
     enriched_metadata_files: int = 0
     failed_metadata_files: int = 0
     duplicate_files: int = 0
+    # Per-paper identifiers (file_name/title/doi/year/chunks) for the papers this
+    # run actually indexed, so an AI assistant reading the index status can look
+    # up the affected papers. Capped at _STATUS_PAPERS_CAP; updated_papers_total
+    # holds the true count when truncated.
+    updated_papers: list[dict[str, Any]] = field(default_factory=list)
+    updated_papers_total: int = 0
 
 
 @dataclass(frozen=True)
@@ -36,6 +42,31 @@ class RefreshSummary:
     papers: int
     chunks_updated: int
     skipped_papers: int
+    updated_papers: list[dict[str, Any]] = field(default_factory=list)
+    updated_papers_total: int = 0
+
+
+# Cap the per-paper list stored in each index-status record so a large --force
+# re-index cannot bloat the status history. The true count is kept separately.
+_STATUS_PAPERS_CAP = 50
+
+
+def _index_status_paper_entry(
+    pdf_path: Path, chunks: int, metadata_map: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """Build a compact identifier record for a paper touched by an update.
+
+    Includes the lookup keys an AI assistant needs (file_name / title / doi /
+    year) plus the chunk count, drawn from the (possibly enriched) metadata.
+    """
+    metadata = metadata_for_pdf(metadata_map, pdf_path)
+    return {
+        "file_name": pdf_path.name,
+        "title": str(metadata.get("title") or ""),
+        "doi": str(metadata.get("doi") or ""),
+        "year": metadata.get("year"),
+        "chunks": chunks,
+    }
 
 
 @dataclass(frozen=True)
@@ -382,6 +413,7 @@ def run_indexing(
     enriched_metadata_files = 0
     failed_metadata_files = 0
     post_index_enrichment_targets = []
+    indexed_paper_tuples: list[tuple[Path, int]] = []
 
     try:
         for target in targets:
@@ -419,6 +451,7 @@ def run_indexing(
 
             indexed_files += 1
             indexed_chunks += len(chunks)
+            indexed_paper_tuples.append((pdf_path, len(chunks)))
             if config.metadata_enrichment.enabled:
                 from rag_paper.enrichment import enrich_targets, target_from_document
 
@@ -467,6 +500,10 @@ def run_indexing(
                 store.update_chunks_metadata(chunks, metadata_for_pdf(metadata_map, pdf_path))
 
     manifest.save()
+    updated_papers_all = [
+        _index_status_paper_entry(pdf_path, chunk_count, metadata_map)
+        for pdf_path, chunk_count in indexed_paper_tuples
+    ]
     return IndexSummary(
         indexed_files=indexed_files,
         skipped_files=skipped_files,
@@ -474,6 +511,8 @@ def run_indexing(
         enriched_metadata_files=enriched_metadata_files,
         failed_metadata_files=failed_metadata_files,
         duplicate_files=duplicate_files,
+        updated_papers=updated_papers_all[:_STATUS_PAPERS_CAP],
+        updated_papers_total=len(updated_papers_all),
     )
 
 
@@ -511,6 +550,7 @@ def refresh_chunk_metadata(
     papers = 0
     chunks_updated = 0
     skipped_papers = 0
+    updated_papers: list[dict[str, Any]] = []
     for source_path, items in groups.items():
         corrected = {
             key: value
@@ -525,6 +565,15 @@ def refresh_chunk_metadata(
         collection.update(ids=ids, metadatas=metadatas)
         papers += 1
         chunks_updated += len(ids)
+        updated_papers.append(
+            {
+                "file_name": Path(source_path).name,
+                "title": str(corrected.get("title") or ""),
+                "doi": str(corrected.get("doi") or ""),
+                "year": corrected.get("year"),
+                "chunks": len(ids),
+            }
+        )
 
     logger.info(
         "index.metadata_refresh",
@@ -532,6 +581,93 @@ def refresh_chunk_metadata(
         chunks_updated=chunks_updated,
         skipped_papers=skipped_papers,
     )
+    # Metadata refresh does not change chunk count, so a long-lived MCP server's
+    # count-based cache would never notice it. Rewrite the manifest to bump its
+    # mtime — the retriever treats that as a "library changed" reload signal.
+    IndexManifest(config.chroma_dir / "index_manifest.json").save()
     return RefreshSummary(
-        papers=papers, chunks_updated=chunks_updated, skipped_papers=skipped_papers
+        papers=papers,
+        chunks_updated=chunks_updated,
+        skipped_papers=skipped_papers,
+        updated_papers=updated_papers[:_STATUS_PAPERS_CAP],
+        updated_papers_total=len(updated_papers),
     )
+
+
+def count_total_chunks(config: AppConfig) -> int | None:
+    """Best-effort total chunk count in the collection (None if Chroma unavailable)."""
+    try:
+        client = chromadb.PersistentClient(path=str(config.chroma_dir))
+        collection = client.get_or_create_collection(
+            name=config.chroma.collection, metadata={"hnsw:space": "cosine"}
+        )
+        return int(collection.count())
+    except Exception as exc:  # noqa: BLE001 - status recording must never break indexing
+        logger.warning("index.status_count_failed", error=str(exc))
+        return None
+
+
+def record_index_status(
+    config: AppConfig,
+    *,
+    command: str,
+    duration_seconds: float,
+    total_chunks: int | None,
+    mode: dict[str, Any],
+    result: dict[str, Any],
+    max_history: int = 25,
+) -> dict[str, Any]:
+    """Prepend a finished update's outcome to the index-status history (newest first).
+
+    The MCP service reads this file so an AI assistant can see when the library
+    last changed and what the update did, without restart or in-memory coupling.
+    """
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "command": command,
+        "duration_seconds": round(duration_seconds, 3),
+        "total_chunks": total_chunks,
+        "mode": mode,
+        "result": result,
+    }
+
+    path = config.index_status_path
+    history: list[dict[str, Any]] = []
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                history = [item for item in data if isinstance(item, dict)]
+            elif isinstance(data, dict):
+                history = [data]
+    except (OSError, json.JSONDecodeError):
+        history = []
+
+    history.insert(0, record)
+    del history[max_history:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    return record
+
+
+def load_index_status(config: AppConfig, *, limit: int = 1) -> list[dict[str, Any]]:
+    """Return the most recent ``limit`` index-status records (newest first).
+
+    Empty list when no update has been recorded yet or the file is unreadable.
+    """
+    path = config.index_status_path
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)][:limit]

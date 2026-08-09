@@ -66,6 +66,7 @@ class IndexingConfig(BaseModel):
     assume_yes: bool = False
     max_files: int | None = Field(default=None, ge=0)
     failed_path: str = "./rag_paper_data/logs/index_failed.jsonl"
+    status_path: str = ""
 
 
 class MetadataEnrichmentConfig(BaseModel):
@@ -88,8 +89,10 @@ class MetadataEnrichmentConfig(BaseModel):
     min_title_score: float = Field(default=3.0, ge=0)
     min_openalex_score: float = Field(default=0.5, ge=0)
     min_title_similarity: float = Field(default=0.6, ge=0, le=1)
+    min_title_similarity_high: float = Field(default=0.85, ge=0, le=1)
     max_query_chars: int = Field(default=300, gt=0)
     cache_path: str = "./rag_paper_data/cache/metadata_enrichment.sqlite3"
+    review_path: str = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -115,8 +118,13 @@ class MetadataEnrichmentConfig(BaseModel):
 
 
 class DedupConfig(BaseModel):
-    enabled: bool = False
-    semantic_enabled: bool = True
+    # On by default so duplicate papers (e.g. the same paper in two roots) are
+    # flagged during indexing. semantic dedup is opt-in: it embeds every
+    # candidate's signature on each run, so it stays off by default to keep
+    # `index` fast. Metadata dedup (DOI / title+year) already catches exact
+    # duplicates cheaply; set semantic_enabled=true for a thorough sweep.
+    enabled: bool = True
+    semantic_enabled: bool = False
     action: Literal["report", "skip"] = "report"
     report_path: str = "./rag_paper_data/logs/duplicate_papers.json"
     similarity_threshold: float = Field(default=0.92, ge=0, le=1)
@@ -146,7 +154,7 @@ class RetrievalConfig(BaseModel):
 
 
 class RerankerConfig(BaseModel):
-    enabled: bool = False
+    enabled: bool = True
     provider: Literal["ollama"] = "ollama"
     base_url: str = "http://127.0.0.1:11434"
     model: str = "dengcao/Qwen3-Reranker-4B:Q5_K_M"
@@ -218,10 +226,12 @@ class AppConfig(BaseModel):
         indexing = dict(normalized.get("indexing") or {})
         indexing.setdefault("metadata_path", f"{data_dir}/paper_metadata.json")
         indexing.setdefault("failed_path", f"{data_dir}/logs/index_failed.jsonl")
+        indexing.setdefault("status_path", f"{data_dir}/logs/index_status.json")
         normalized["indexing"] = indexing
 
         enrichment = dict(normalized.get("metadata_enrichment") or {})
         enrichment.setdefault("cache_path", f"{data_dir}/cache/metadata_enrichment.sqlite3")
+        enrichment.setdefault("review_path", f"{data_dir}/logs/enrichment_review.jsonl")
         normalized["metadata_enrichment"] = enrichment
 
         dedup = dict(normalized.get("dedup") or {})
@@ -306,6 +316,10 @@ class AppConfig(BaseModel):
         return Path(self.indexing.failed_path).expanduser().resolve()
 
     @property
+    def index_status_path(self) -> Path:
+        return Path(self.indexing.status_path).expanduser().resolve()
+
+    @property
     def stats_path(self) -> Path:
         return Path(self.logging.stats_path).expanduser().resolve()
 
@@ -324,6 +338,10 @@ class AppConfig(BaseModel):
     @property
     def metadata_cache_path(self) -> Path:
         return Path(self.metadata_enrichment.cache_path).expanduser().resolve()
+
+    @property
+    def enrichment_review_path(self) -> Path:
+        return Path(self.metadata_enrichment.review_path).expanduser().resolve()
 
 
 def load_config(path: str | Path) -> AppConfig:

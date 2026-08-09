@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import locale
+import time
+from dataclasses import asdict
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -14,11 +16,17 @@ from rag_paper.citation_graph import build_citation_graph
 from rag_paper.config import AppConfig, load_config, write_default_config
 from rag_paper.dedup import run_dedup_report
 from rag_paper.enrichment import discover_enrichment_targets, enrich_targets
-from rag_paper.indexer import IndexPlan, SkipMarkerHit, refresh_chunk_metadata, run_indexing
+from rag_paper.indexer import (
+    IndexPlan,
+    SkipMarkerHit,
+    count_total_chunks,
+    record_index_status,
+    refresh_chunk_metadata,
+    run_indexing,
+)
 from rag_paper.inspection import (
     IndexedPaperDetail,
     delete_indexed_paper_details,
-    delete_indexed_papers,
     inspect_indexed_paper,
     inspect_indexed_papers,
     is_pdf_indexed,
@@ -82,7 +90,15 @@ def index(
     """Vectorize PDFs and store chunks in Chroma."""
     config = load_app_config(config_path)
     if update_metadata_only:
+        started = time.monotonic()
         summary = refresh_chunk_metadata(config)
+        _record_index_update(
+            config,
+            command="index",
+            mode={"update_metadata_only": True},
+            duration=time.monotonic() - started,
+            result=asdict(summary),
+        )
         table = Table(title="Index Metadata Refresh Summary")
         table.add_column("Metric")
         table.add_column("Value", justify="right")
@@ -95,6 +111,7 @@ def index(
     confirm_skip_markers = (
         _ack_skip_markers if yes or config.indexing.assume_yes else _confirm_skip_markers
     )
+    started = time.monotonic()
     summary = run_indexing(
         config,
         force=force,
@@ -104,6 +121,19 @@ def index(
         max_files=max_files,
         confirm_plan=confirm_plan,
         confirm_skip_markers=confirm_skip_markers,
+    )
+    _record_index_update(
+        config,
+        command="index",
+        mode={
+            "force": force,
+            "file": file_path,
+            "only_new": only_new,
+            "retry_failed": retry_failed,
+            "update_metadata_only": False,
+        },
+        duration=time.monotonic() - started,
+        result=asdict(summary),
     )
     table = Table(title="Index Summary")
     table.add_column("Metric")
@@ -263,6 +293,11 @@ def build_citation_graph_command(config_path: str) -> None:
     is_flag=True,
     help="Re-check DOIs already in metadata and replace any whose title no longer matches.",
 )
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Classify every PDF and report, but write nothing (no metadata, no Chroma).",
+)
 @click.option("--file", "file_path", help="Enrich one PDF file.")
 @click.option("--yes", is_flag=True, help="Start enrichment without interactive confirmation.")
 @click.option("--max-files", default=None, type=click.IntRange(min=0), help="Maximum PDFs to enrich.")
@@ -270,6 +305,7 @@ def enrich_metadata_command(
     config_path: str,
     force: bool,
     reverify: bool,
+    dry_run: bool,
     file_path: str | None,
     yes: bool,
     max_files: int | None,
@@ -294,6 +330,7 @@ def enrich_metadata_command(
         metadata_map=metadata_map,
         force=force,
         reverify=reverify,
+        dry_run=dry_run,
     )
 
     table = Table(title="Metadata Enrichment Summary")
@@ -301,11 +338,19 @@ def enrich_metadata_command(
     table.add_column("Value", justify="right")
     table.add_row("Checked files", str(summary.checked_files))
     table.add_row("Updated files", str(summary.updated_files))
+    table.add_row("Low-confidence (review queue)", str(summary.low_confidence_files))
     table.add_row("Cleared files", str(summary.cleared_files))
     table.add_row("Skipped files", str(summary.skipped_files))
     table.add_row("Failed files", str(summary.failed_files))
     table.add_row("Metadata path", str(config.metadata_path))
+    if summary.review_path:
+        table.add_row("Review queue", summary.review_path)
     console.print(table)
+    if summary.low_confidence_files:
+        console.print(
+            "[bold yellow]Low-confidence matches were queued, not written. Review "
+            f"{summary.review_path} and accept by hand if correct.[/bold yellow]"
+        )
 
 
 @cli.command("serve")
@@ -316,11 +361,18 @@ def enrich_metadata_command(
     default=None,
     help="Override mcp.transport for this run.",
 )
-def serve(config_path: str, transport: str | None) -> None:
+@click.option(
+    "--no-rerank",
+    is_flag=True,
+    help="Disable the reranker for this run (it is on by default).",
+)
+def serve(config_path: str, transport: str | None, no_rerank: bool) -> None:
     """Start the MCP knowledge retrieval service."""
     config = load_app_config(config_path)
     if transport is not None:
         config.mcp.transport = cast(McpTransport, transport)
+    if no_rerank:
+        config.reranker.enabled = False
 
     service_console = Console(stderr=config.mcp.transport == "stdio")
     table = Table(title="MCP Service")
@@ -333,6 +385,7 @@ def serve(config_path: str, transport: str | None) -> None:
     if config.mcp.endpoint_url is not None:
         table.add_row("Endpoint", config.mcp.endpoint_url)
     table.add_row("Embedding", f"{config.embedding.provider}:{config.ollama.model}")
+    table.add_row("Reranker", "on" if config.reranker.enabled else "off")
     for paper_dir in config.paper_dirs:
         table.add_row("Paper root", str(paper_dir))
     table.add_row("Chroma dir", str(config.chroma_dir))
@@ -514,6 +567,26 @@ def _default_datetime_format() -> str:
     except locale.Error:
         pass
     return "%c"
+
+
+def _record_index_update(
+    config: AppConfig,
+    *,
+    command: str,
+    mode: dict[str, Any],
+    duration: float,
+    result: dict[str, Any],
+) -> None:
+    """Persist the outcome of a manual `index` run so the MCP service can surface
+    the most recent update to an AI assistant."""
+    record_index_status(
+        config,
+        command=command,
+        duration_seconds=duration,
+        total_chunks=count_total_chunks(config),
+        mode=mode,
+        result=result,
+    )
 
 
 def _confirm_index_plan(plan: IndexPlan) -> None:

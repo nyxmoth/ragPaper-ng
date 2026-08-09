@@ -29,6 +29,10 @@ def configure_logging(config: AppConfig) -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # Suppress the MCP library's request-processing INFO logs (e.g.
+    # "Processing request of type ListPromptsRequest") which pollute stderr in
+    # stdio mode and get surfaced as warnings by MCP Hub.
+    logging.getLogger("mcp").setLevel(logging.WARNING)
     structlog.configure(
         processors=processors,
         wrapper_class=structlog.make_filtering_bound_logger(
